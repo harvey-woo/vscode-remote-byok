@@ -1,420 +1,213 @@
 # vscode-remote-byok
 
-让 **Remote-SSH 远程窗口**里的官方 Copilot（agent-host 会话：Copilot CLI / Chat）
+让 **Remote-SSH 远程窗口**里的 Copilot agent-host 会话（Copilot CLI / Chat）
 能用 `chatLanguageModels.json` 里的自定义模型。
 
-解决的问题：远程窗口里模型选择器**只有 Auto**，即使按官方文档把配置放到远程也没用。
-
-```
-vscode-remote-byok/
-├── README.md                                本文
-├── QUICKSTART.md                            30 秒上手
-├── patch.mjs                                补丁脚本（--check / --force / --revert / --dry-run）
-├── adapter.js                               agent host 侧适配器（读配置、provider 映射、密钥解析）
-├── server-bridge.js                         可选：server 侧用 SecretStorage 解析占位符（默认关）
-├── example.chatLanguageModels.json          配置示例（标准占位符，不含密钥）
-└── example.chatLanguageModels.secrets.json  密钥兜底文件示例（0600）
-```
+不用这个补丁时，远程窗口的模型选择器**只有 Auto**。
 
 ---
 
-## 1. 现象与官方立场
+# 一、怎么用
 
-远程窗口里，agent-host 会话的模型选择器**只有 Auto**；本机同样配置却正常。
+## 1. 打补丁
 
-VS Code 会主动弹一条警告，出处
-`src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostRemoteByokNotification.ts`：
+```bash
+S=~/.vscode-server/cli/servers/Stable-<commit>/server
+NODE="$S/node"
 
-```js
-message:     "Bring your own key (BYOK) models aren't supported in remote Copilot sessions."
-description: "Use a GitHub Copilot model for this session, or switch to the local agent harness to use your own models."
+scp patch.mjs adapter.js server-bridge.js <host>:/tmp/vrb/
+ssh <host> 'cd /tmp/vrb && "$NODE" patch.mjs --server-dir "'"$S"'"'
 ```
 
-运行时闸门在 `src/vs/platform/agentHost/node/agentHostMain.ts`：
+> `--server-dir` 指向 `<cli-data-dir>/cli/servers/Stable-<commit>/server`。
+> 不知道是哪个：`ls -1t ~/.vscode-server/cli/servers/ | head -1`。
 
-```js
-const server = utilityProcessServer ?? new ChildProcessServer(AgentHostIpcChannels.AgentHost);
-if (server instanceof UtilityProcessServer) {          // ← 只有「本机 utility process」进得来
-    byokLmBridgeRegistry.register(clientId,
-        createAgentHostClientByokLmConnection(getChannel(AGENT_HOST_CLIENT_BYOK_LM_CHANNEL)));
-}
+## 2. 写配置
+
+```bash
+install -m 600 /dev/null ~/.vscode-server/data/User/chatLanguageModels.json
+cat > ~/.vscode-server/data/User/chatLanguageModels.json <<'JSON'
+[
+  {
+    "name": "My Endpoint",
+    "vendor": "customendpoint",
+    "apiType": "chat-completions",
+    "apiKey": "${input:chat.lm.secret.0123456789}",
+    "models": [
+      { "id": "my-model", "name": "My Model", "url": "https://api.example.com/v1",
+        "maxInputTokens": 200000, "maxOutputTokens": 16000 }
+    ]
+  }
+]
+JSON
 ```
 
-Remote-SSH 时 agent host 是 server 拉起的**子进程**（`ChildProcessServer`）→ 整块被跳过
-→ `getModels()` 恒空。上游注释也点名了：`byokLmBridgeRegistry.ts` 里
-*"…e.g. **the remote agent host**…"*。
+## 3. 给密钥
 
-相关配置项只有两个，都救不了：
+`apiKey` 有两条路，取决于那台机器有没有 keyring。
 
-| 设置项 | 实际作用 |
-| --- | --- |
-| `chat.agentHost.byokModels.enabled` | 只 gate 上面那个「远程根本不执行」的分支 |
-| `chat.agentHost.remoteByokNotification.disabled` | 只是把那条警告静音 |
+**先判断**：`ls ~/.local/share/keyrings/` 有内容、且
+`~/.vscode-server/data/User/globalStorage/state.vscdb` 里有 `secret://chat.lm.secret.*`
+→ 有；否则没有（headless 服务器通常没有）。
 
-**结论：纯配置无解。**
+**A. 有 keyring：用 VS Code 自己的方式（推荐）**
 
----
+1. 远程窗口命令面板 `Manage Models` → 选中该 vendor 组 → 填 key
+   （key 进 SecretStorage，配置文件里仍是占位符）
+2. 打开桥接，让 server 把值注入 agent host：
 
-## 2. 为什么补丁能这么小
+   ```bash
+   echo 'export VSCODE_BYOK_BRIDGE=1' >> ~/.vscode-server/server-env-setup
+   ```
 
-`copilotSessionLauncher.ts` 的 `synthesizeByokSessionConfig`（bundle 内 `znt()`）只有两个输入：
+   > ⚠️ 这一句**只在部分构建里生效**（由启动脚本 source）。实测 VS Code Server 1.145
+   > 的 `bin/code-server` **不** source 它，ssh 非登录 shell 也不读 `.bashrc`/`.profile`。
+   > 如果你的机器不生效，就用下面的 B。
 
-```js
-let byokModels = [...bridgeRegistry.getModels()];              // ① 模型来源
-const providers = [...new Set(byokModels.map(m => m.vendor))].map(vendor => ({
-    name: vendor, type: 'openai', wireApi: 'responses',        // ② 端点
-    baseUrl: handle.providerBaseUrl(vendor),                   //    指向 BYOK 回环代理
-    bearerToken: `${handle.nonce}.${sessionId}`,
-}));
-const models = byokModels.map(m => ({ id: getByokLmSelectionModelId(m), provider: m.vendor, … }));
-```
+**B. 没有 keyring：直接写明文 `apiKey`**
 
-Copilot SDK 的 provider **默认 wireApi 就是 `completions`**
-（`modelUsesResponsesApi`: `(n.wireApi ?? "completions") === "responses"`）。
-
-所以把 ② 换成「直连真实端点 + `wireApi:'completions'`」就**不需要回环代理，也不需要协议翻译**；
-剩下的只是把 ① 喂上。
-
----
-
-## 3. 补丁做了什么
-
-改 **两个** 文件，共 9 处注入。
-
-### A. `out/vs/platform/agentHost/node/agentHostMain.js`（6 处）
-
-| # | 位置 | 改动 |
-| --- | --- | --- |
-| 1 | 文件顶部 | 插入 `adapter.js` |
-| 2 | `byok:{kind:"renderer",bridgeRegistry:b}` **之前最近的** `b=new MW` | 追加 `,b=__vscodeRemoteByok.wrap(b)` → 补上 `getModels()` |
-| 3 | `znt()` providers 段 | `let a=__vscodeRemoteByok.providers(n,()=>原表达式),` —— 原生在用就交还原生 |
-| 4 | `znt()` models 段 | `provider: __vscodeRemoteByok.providerFor(l)` —— 原生在用就返回 `l.vendor`（等价于原样） |
-| 5 | `function BQ(o,i,e,t){` | 开头短路我们模型的 `reasoningEffort` |
-| 6 | `function GQ(o,i,e){` | 开头短路我们模型的 `contextTier` |
-
-> 第 2 处为什么不取「全文第一个 `b=new X`」：压缩后的标识符在作用域内会复用
-> （同一个 `b` 可能既是 `TextDecoder` 又是 registry），必须锚定在 byok 描述符**之前最近的**那个。
-
-### B. `out/server-main.js`（3 处，默认关闭）
-
-| # | 位置 | 改动 |
-| --- | --- | --- |
-| 7 | 文件顶部 | 插入 `server-bridge.js` |
-| 8 | `X.createInstance(<Starter>)` | 包成 `Object.assign(…, {__di: X})`，把 DI 容器挂到 starter 实例 |
-| 9 | `<Starter>.start()` 开头 | `VSCODE_BYOK_BRIDGE=1` 时，用 server 的 SecretStorage 解析占位符 → 通过 `VSCODE_BYOK_SECRETS_JSON` 注入子进程 |
-
-B 段默认**关闭**，原因见 §7。
-
----
-
-## 4. 本机（原生 BYOK 可用）会不会重复 provider？
-
-**不会 —— 适配器在这里是「纯兜底」，原生有模型时完全让位。**
-
-这点很关键：**本机**（agent host 是 utility process）原生 BYOK 桥是**好的**，
-如果适配器还去合并/覆盖，就会出问题：
-
-| 缺陷 | 后果 |
-| --- | --- |
-| `getModels()` 把「原生 + 文件」合并 | vendor 被重命名时同一模型出现两个 id → **重复 provider** |
-| `providers()` 无条件返回直连端点 | 原生模型被指向直连地址，丢掉 loopback proxy + nonce → **原生 BYOK 直接坏掉** |
-| `isOurs()` 对原生模型也返回 true | 把原生模型的 `reasoningEffort` 也清零 → **功能退化** |
-
-所以判定逻辑是：**`registry.getModels()` 返回非空 = 原生在工作 = 我们全静默。**
-
-```js
-let nativeActive = false;
-
-getModels(){                                  // 每次动态判断
-  const base = orig();                        // 原生桥给了什么？
-  nativeActive = base.length > 0;
-  return nativeActive ? base : ourModels;     // 原生优先，绝不合并
-}
-
-isOurs(id)      { if (nativeActive) return false;  … }   // 不改原生模型行为
-providerFor(m)  { if (nativeActive) return m.vendor; … } // 等价于原样
-providers(n,fb){ if (nativeActive) return fb();  … }     // 交还原生 provider 构造
-```
-
-`providers()` 的第二个参数就是**原始表达式**（指向 loopback proxy + nonce bearer），
-补丁把它原样作为 thunk 传进去，所以原生路径是**逐字节等价**的。
-
-动态性也验证过：agent host 先启动、renderer 后连上并推送模型时，
-标志会自动翻转（先用自己的模型，一旦原生有模型立刻让位，且不合并）。
-
-## 5. 三个必须知道的坑
-
-### 5.1 provider 名必须等于 vendor（否则 `400 The requested model is not supported`）
-
-```js
-function Zq(o){ return `${o.vendor}/${m_(o)}` }      // ① 客户端看到的模型 id
-// ② 原始 znt(): providers 的 name 就是 l.vendor；models 的 provider 也是 l.vendor
-```
-
-SDK 的 BYOK 键 = `<provider 名>/<selectionId>`，只有 `provider 名 === vendor` 时它才等于 ①。
-若为了让「一个 vendor 挂多个端点」而把 provider 名做成 `` `${vendor}--${hash}` ``，SDK 就查不到：
-
-```js
-resolveModelBackend(e){ let n = this.byokModels.get(e);
-  if (!n) return { backend: "capi", id: e };   // ← 回落官方 API → 400（错误里带 GH 请求 ID）
-}
-```
-
-**做法：改写 vendor 本身**（单端点保持原名，多端点加 `--<hash>`），
-并让 `vendor` / provider 名 / `modelIdentifier` 三处一致。
-
-### 5.2 reasoningEffort 必须在 agent host 侧压掉
-
-```js
-async _createSession(...){
-  let s = r ? k1(i.model, r) : i.model;
-  …client.createSession({ …, reasoningEffort: BQ(s, …), contextTier: GQ(s, …) })
-}
-function qnt(o){ let e = o?.config?.["thinkingLevel"] ?? o?.config?.["reasoningEffort"]; … }
-function BQ(o,i,e,t){ return lAe(o, dAe(o,i,e,t) ?? qnt(o)) }
-```
-
-只要**客户端**仍带该模型的 `config.thinkingLevel`（可能是上次交互残留），
-`reasoningEffort` 就会被送进 SDK；而 SDK 的元数据按 `capabilityModelId` 去官方模型目录查，
-自定义模型不在目录 → 判定不支持 → 会话构造失败：
-
-```
-session construction failed: Model '<vendor>/<group>/<id>' does not support reasoning effort configuration.
-```
-
-所以补丁在 `BQ`/`GQ` 开头直接短路。**这比只改模型能力更硬 —— 不依赖客户端刷新缓存。**
-
-### 5.3 `baseUrl` 必须给根地址
-
-SDK 会自己往 baseUrl 后拼 wire 路径（本地 BYOK 代理的 baseUrl 是
-`http://127.0.0.1:<port>/v/<vendor>`，请求实际落到 `…/v/<vendor>/responses` —— 路径是 SDK 拼的）。
-给全路径会拼成 `…/v1/chat/completions/chat/completions` → 404。
-适配器会剥掉 wire 后缀并按 `/v<N>` 规则补 `/v1`。
-
----
-
-## 6. 配置与密钥
-
-### 6.1 两件事要分清
-
-VS Code 的 `chatLanguageModels.json` **只存占位符，不含密钥**；密钥在 **SecretStorage**：
-
-```js
-// ExtHostLanguageModels._resolveConfiguration
-if (schema.properties?.[prop]?.secret) {
-    const name = this.decodeSecretKey(value);      // ${input:chat.lm.secret.X} → chat.lm.secret.X
-    value = name ? await this._secretStorageService.get(name) : void 0;
-}
-```
-
-而且 `decodeSecretKey` 对**任何字符串**都做 `substring(indexOf(':')+1, len-1)`
-（`Me(r){return typeof r=="string"}`），所以**明文 `apiKey` 会被截断再当 key 名查 → 必然失效**。
-只有 `${input:…}` 有效。
-
-因此「**文件格式**」和「**谁能拿到密钥**」是两件事：
-
-| | 是否标准 | 说明 |
-| --- | --- | --- |
-| 文件里的占位符格式 | ✅ 标准 | 本机 / 远程的 VS Code 都能正确**解析**这个文件，同一份可原样复制 |
-| 本机密钥来源 | ✅ 标准 | SecretStorage（`Manage Models` 输一次即可） |
-| **远程 agent host 的密钥来源** | ⚠️ 非标准 | 该进程里没有 SecretStorage，见 §6.4 / §7 |
-
-### 6.2 文件：保持标准格式
+适配器是直接读文件的，所以明文在我们的代码路径上可用：
 
 ```jsonc
-{
-  "name": "My Endpoint",
-  "vendor": "customendpoint",
-  "apiType": "chat-completions",
-  "apiKey": "${input:chat.lm.secret.0123456789}",   // ★ 与 VS Code 自己写出来的完全一致
-  "models": [{
-    "id": "my-model",
-    "name": "My Model",
-    "url": "https://api.example.com/v1",
-    "maxInputTokens": 400000,
-    "maxOutputTokens": 64000,
-    "vision": true
-  }]
-}
+"apiKey": "YOUR-API-KEY"
 ```
 
-放远程：`<data-dir>/User/chatLanguageModels.json`
-（`<data-dir>/Machine/` 兜底；因为 `appSettingsHome = join(userDataPath, 'User')`）。
+代价两条，想清楚再用：
 
-### 6.3 各场景怎么放密钥
+- 密钥以明文存在配置文件里
+- **只有 agent-host 会话能用**。普通 Chat 仍走 VS Code 的解析器
+  （`decodeSecretKey` 会把明文截断后当 key 名去查 SecretStorage），所以那边拿不到
 
-| 场景 | 做法 | 是否标准 |
-| --- | --- | --- |
-| **本机桌面 VS Code** | `Manage Models` 填一次 key → 进本机 SecretStorage | ✅ 标准（本机不需要本补丁） |
-| **远程窗口 · 普通 Chat** | 在**远程窗口**里 `Manage Models` 填一次 | ✅ 标准（前提：该机 SecretStorage 可用） |
-| **远程窗口 · agent-host 会话** | 额外喂一次（见 §6.4） | ⚠️ 非标准，补丁的固有代价 |
+为什么不能既标准又简单：VS Code 设计上密钥只存 SecretStorage，
+而远程 agent host 里**没有** SecretStorage（bundle 内 `secretStorageService` 为 0 处），
+所以它只能靠外部给它 —— 要么桥接从 SecretStorage 拿（需 keyring），要么明文放文件。
 
-### 6.4 远程 agent host 的密钥来源（按优先级）
+## 4. 让补丁生效
 
-1. **`VSCODE_BYOK_SECRETS_JSON`** —— JSON 字符串，由 server 侧桥接注入（§7），或你自己的启动 wrapper 给
-2. **`VSCODE_SECRET_<NAME>`** 环境变量，如 `chat.lm.secret.ab12cd34` → `VSCODE_SECRET_CHAT_LM_SECRET_AB12CD34`
-3. **同级 secrets 文件**（0600）：
-
-   ```
-   <配置文件所在目录>/chatLanguageModels.secrets.json
-   { "chat.lm.secret.0123456789": "REPLACE_WITH_YOUR_KEY" }
-   ```
-
-   也认 `<配置文件去掉 .json>.secrets.json`。
-
-> 第 3 条是**本补丁的扩展**，不是 VS Code 的设计。它只补「agent host 拿不到 SecretStorage」
-> 这件事，**不改变配置文件的标准性**：配置仍是纯占位符，仍可在本机/远程之间原样复制。
-
-三者都没有 → 记入 `missingSecrets` 并明确告警（不再静默 401）。
-
-### 6.5 其他写法（兼容，一般不需要）
-
-| 写法 | 说明 |
+| 改了什么 | 需要重启 |
 | --- | --- |
-| `apiKey: "YOUR-API-KEY"` | ⚠️ VS Code 侧无效（会被截断再当 key 名查）；补丁会直接用，但两边行为不一致，不建议 |
-| `requestHeaders: { authorization: "Bearer ${apiKey}" }` | 用解析后的 `apiKey` 填充该头 |
-| `requestHeaders: { "x-api-key": "${input:chat.lm.secret.X}" }` | 头里也可写占位符 |
-| `requestHeaders: { authorization: "Bearer YOUR-API-KEY" }` | 明文头（网关不吃 `Authorization` 时才需要） |
+| 只改了配置 / 环境变量 | **agent host**（重载或重连远程窗口） |
+| 打了补丁（server-main 段） | **server 进程**（断开所有远程连接再连） |
 
-### 6.6 不要写 reasoning effort
-
-不要写 `supportsReasoningEffort` / `settings.reasoningEffort` —— 适配器会忽略（§5.2），
-写了也只会在诊断里记一条 skip。
-
----
-
-## 7. 可选：B 段（让密钥走真正的 SecretStorage）
-
-B 段会在 fork agent host 之前，用 **server 自己的 SecretStorage** 解析占位符，
-结果经 `VSCODE_BYOK_SECRETS_JSON` 注入子进程（子进程 env = `i8(process.env, …)`，可继承）。
-
-### 默认关闭
-
-需要 `VSCODE_BYOK_BRIDGE=1`。
-
-**原因（实测）**：在**无头 Linux（没有 keyring / Secret Service）**上，
-`instantiationService.get(secretStorageService)` 会**同步阻塞** —— 日志停在
-`di.get(token=secretStorageService) …` 就再也不返回，连 `Promise.race` 的超时也抢不走
-（同步阻塞时定时器不跑）。一旦阻塞会拖住 agent host 启动。
-有可用 keyring 的机器上它是即时且正常的，所以做成开关。
-
-### 启用与验证
-
-```bash
-echo 'export VSCODE_BYOK_BRIDGE=1' >> ~/.vscode-server/server-env-setup
-# 重启 server 后：
-tail -5 /tmp/vscode-remote-byok.log
-#   bridge: resolved N/M secret(s) from SecretStorage   → 成功
-#   bridge: SecretStorage has 0/M (k timed out)          → 该机不可用，继续用兜底
-```
-
-判定某台机器能否用标准流程：
-
-```bash
-ls -la <data-dir>/User/globalStorage/state.vscdb    # 存在且含 secret://chat.lm.secret.* 才有数据
-ls -la ~/.local/share/keyrings/ 2>/dev/null         # 无 keyring 的机器基本用不了
-```
-
----
-
-## 8. 用法
-
-```bash
-S=<server bundle 根目录>       # ~/.vscode-server/cli/servers/Stable-<commit>/server
-NODE="$S/node"                 # server 自带的 node；没有就用系统 node
-
-"$NODE" patch.mjs --server-dir "$S"              # 打补丁（自动备份 .orig、幂等、node --check）
-"$NODE" patch.mjs --server-dir "$S" --check      # 自检（升级后会失效）
-"$NODE" patch.mjs --server-dir "$S" --force      # 改了 adapter.js / server-bridge.js 后重打
-"$NODE" patch.mjs --server-dir "$S" --revert     # 回滚（两个文件一起还原）
-"$NODE" patch.mjs --server-dir "$S" --dry-run    # 只报告注入点与字节数
-```
-
----
-
-## 9. 生效（最容易踩的一步）
-
-| 段 | 需要什么 | 说明 |
-| --- | --- | --- |
-| A（agent host） | **agent host 进程重启** | 重载/重连窗口即可 |
-| B（server-main） | **server 进程重启** | label 窗口重载**不会**重启 server |
-
-判断是否真的换了进程（对比启动时间与补丁 mtime）：
+确认进程真的换了：
 
 ```bash
 ps -eo pid,lstart,args | grep "[t]ype=agentHost"
-stat -c '%y' "$S/out/vs/platform/agentHost/node/agentHostMain.js"   # macOS: stat -f %Sm
+stat -c '%y' "$S/out/vs/platform/agentHost/node/agentHostMain.js"   # 启动时间要晚于 mtime
 ```
 
-- **进程启动时间早于补丁 mtime** → 还在跑旧代码
-- 让 server 重启：断开所有远程连接后重连；或精确 kill（见下）
-
-> ⚠️ **别用 `ps | grep` 拿 pid 直接 kill** —— 会把 grep 自己/你的 shell 也算进去。
-> 安全做法（精确匹配 cmdline 的第 2 个参数）：
->
-> ```bash
-> for d in /proc/[0-9]*; do p=${d#/proc/}; [ -r "$d/cmdline" ] || continue
->   case "$(tr '\0' '\n' < "$d/cmdline" | sed -n '2p')" in */out/server-main.js) echo "$p";; esac
-> done
-> ```
->
-> ⚠️ `ServerAgentHostManager` 有**重启预算**：连续失败 5 次会 `giving up after 5 restarts`。
-> 但预算耗尽时 `_restartCount` 已归零，且 server 有 lazy 的 `agentHostProxy` 通道
-> **每次 renderer 连接都会 `ensureStarted()`** → **重载/重连窗口就能拉回来**。
-
----
-
-## 10. 诊断
+## 5. 验证
 
 ```bash
 cat /tmp/vscode-remote-byok.log
+# 期望：loaded pid=… models=1 providers=1        （没有 skipped=）
 ```
 
-| 日志 | 含义 |
-| --- | --- |
-| `loaded pid=… file=… models=N providers=M` | 适配器已加载（N=0 检查路径/JSON） |
-| `skipped=N` | N 条被跳过的模型/配置（`VSCODE_REMOTE_BYOK_DEBUG=1` 看详情） |
-| `[Copilot:…] Wired N BYOK model(s) across M provider(s) via …` | 已注入该会话 |
-| `Using custom provider: type=openai, baseUrl=…, wireApi=completions` | SDK 确认用了我们的 provider（**成功标志**） |
-| `400 … The requested model is not supported` | 回落官方 API → §5.1 的 id 不一致 |
-| `does not support reasoning effort configuration` | §5.2 未生效（进程没换 / 补丁没打） |
-| `bridge: resolved …` | B 段成功 |
-| `bridge: SecretStorage has 0/…` | 该机拿不到密钥，继续用兜底 |
+然后在远程窗口的 agent-host 会话里选模型发消息。日志出现下面这行就说明走通了：
 
-环境变量：
+```
+[Copilot:…] Using custom provider: type=openai, baseUrl=…, wireApi=completions
+```
 
-| 变量 | 作用 |
+## 6. 排查
+
+| 现象 | 原因 |
 | --- | --- |
-| `VSCODE_REMOTE_BYOK_LOG` | 日志路径（默认 `/tmp/vscode-remote-byok.log`） |
-| `VSCODE_REMOTE_BYOK_DEBUG=1` | 详细日志 |
-| `VSCODE_REMOTE_BYOK_FILE` | 显式指定配置文件 |
-| `VSCODE_REMOTE_BYOK_SECRETS` | 显式指定 secrets 文件 |
-| `VSCODE_BYOK_SECRETS_JSON` | 直接给一份 `{name: value}` JSON（最高优先级） |
-| `VSCODE_BYOK_BRIDGE=1` | 开启 B 段（server 侧 SecretStorage 桥接） |
+| 选择器里没有模型 | 配置路径不对，或 `models=0` |
+| `400 The requested model is not supported` | 回落官方 API → §2.1 |
+| `does not support reasoning effort configuration` | 进程没换，还在跑旧代码 |
+| 401 / 未授权 | 密钥没解析到 → 看日志里的 `missingSecrets` |
+| 什么都没变 | 补丁没生效 → 对比进程启动时间与补丁 mtime |
+
+## 7. 命令
+
+```bash
+"$NODE" patch.mjs --server-dir "$S"            # 打补丁（自动备份 .orig、幂等）
+"$NODE" patch.mjs --server-dir "$S" --check    # 自检（VS Code 升级后会发现失效）
+"$NODE" patch.mjs --server-dir "$S" --force    # 改了 adapter/bridge 后重打
+"$NODE" patch.mjs --server-dir "$S" --revert   # 回滚
+"$NODE" patch.mjs --server-dir "$S" --dry-run  # 只报告注入点
+```
+
+## 8. 本机需要吗
+
+**不需要。** 本机 agent host 是 utility process，原生 BYOK 正常。
+适配器是**纯兜底**：原生有模型时就完全让位，不会重复也不会影响原生行为。
 
 ---
 
-## 11. 限制
+# 二、原理
 
-- 仅对 **agent-host 会话** 生效（远程窗口里 Copilot CLI / Chat 都走远程 agent host）。
-- 这是**改 bundle** 的做法，不是官方支持路径；VS Code 升级会换 server commit，补丁失效
-  （`--check` 会发现，重跑即可）。
-- 自定义模型不支持 reasoning effort 选择器（§5.2）。
-- `apiType: "messages"`（Anthropic 形状）会被降级为 chat-completions 处理。
-- 在无 keyring 的机器上，B 段不可用（§7）。
+## 2.1 官方不支持，因为桥只在 utility process 注册
 
----
+```js
+// agentHostMain.ts
+const server = utilityProcessServer ?? new ChildProcessServer(…);
+if (server instanceof UtilityProcessServer) {        // Remote-SSH 走的是子进程
+    byokLmBridgeRegistry.register(clientId, …);      // ← 整块被跳过
+}
+```
 
-## 12. 已验证
+结果 `getModels()` 恒空，模型选择器只剩 Auto。
+上游自己也这么写（`byokLmBridgeRegistry.ts`：*"…e.g. the remote agent host…"*），
+VS Code 还会主动弹窗提示 "BYOK models aren't supported in remote Copilot sessions"。
 
-- 全新 bundle 副本：`--dry-run` / apply / `--check` / `--revert` 全通过；两个文件 `node --check` 通过
-- 补丁后 server 可正常启动（本地冒烟：socket 建立、进程存活）
-- `BQ`/`GQ` 守卫**功能**测试：我们的模型返回 `undefined` 且**不调用**辅助函数（真短路）；
-  官方模型 `copilot/auto` 行为不变
-- id 一致性：`modelIdentifier` 的 vendor 前缀 == `providerFor()` == provider 名
-- 多端点（同一 vendor 多个 URL/凭据）自动分配唯一 vendor，三处一致
-- 模型 id 稳定：换密钥不改变 id（provider 名不与密钥值相关）
-- 凭据解析矩阵：标准占位符（文件/环境变量/注入 JSON）、明文 `apiKey`、
-  `requestHeaders: Bearer ${apiKey}`、头内占位符、缺失场景（正确报 `missingSecrets`）
-- 真实远程：适配器随 agent host 启动加载；端点调用返回 `200` 且模型有正常回复
-- B 段：注入点与开关校验通过；**在无 keyring 的机器上实测会阻塞，故默认关闭**
+## 2.2 补丁只做三件事
+
+`znt()`（会话配置合成）只有两个输入，补丁各补一半：
+
+```js
+let byokModels = [...bridgeRegistry.getModels()];     // ① 模型来源 → 从配置读
+const providers = ...map(vendor => ({
+    name: vendor, wireApi: 'responses',
+    baseUrl: handle.providerBaseUrl(vendor),          // ② 端点 → 直连真实地址
+}));
+```
+
+Copilot SDK 的 provider 默认 `wireApi` 就是 `completions`，
+所以直连即可，**不需要回环代理，也不需要协议翻译**。
+
+共 9 处注入，两个文件：
+
+| 文件 | 处 | 内容 |
+| --- | --- | --- |
+| `agentHostMain.js` | 6 | 插入 adapter、包住 registry、改 providers/models、短路 BQ/GQ |
+| `server-main.js` | 3 | 插入 bridge、挂 DI、在 start() 里解析占位符注入 env（`VSCODE_BYOK_BRIDGE=1` 才启用） |
+
+## 2.3 三个坑
+
+**① provider 名必须等于 vendor**
+
+客户端 id 是 `${vendor}/${id}`，SDK 的 BYOK 键是 `${provider}/${id}`。
+不一致 → SDK 查不到 → 回落官方 API → `400`。
+所以多端点要改写 **vendor**，不能改 provider 名。
+
+**② reasoningEffort 必须压掉**
+
+`BQ()` 会把客户端带来的 `thinkingLevel` 翻成 `reasoningEffort` 传给 SDK；
+SDK 去官方模型目录查不到自定义模型 → 判定不支持 → 会话构造失败。
+补丁在 `BQ`/`GQ` 开头直接返回 `undefined`。
+
+**③ `baseUrl` 必须是根地址**
+
+SDK 自己拼 wire 路径，给全路径会变成 `…/chat/completions/chat/completions` → 404。
+
+## 2.4 密钥为什么这么别扭
+
+VS Code 的配置只接受占位符，真值在 SecretStorage：
+
+```js
+_resolveConfiguration(){ if (secret) { name = decodeSecretKey(v); v = await secretStorage.get(name); } }
+```
+
+`decodeSecretKey` 对任何字符串都做 `substring`，所以**明文会被截断后当 key 名去查** → 失效。
+
+而 agent host 里没有 SecretStorage，只能由外部喂：桥接从 SecretStorage 解（需 keyring），
+或直接把明文写进文件（我们的代码路径能读，但只有 agent-host 生效）。
+
+## 2.5 限制
+
+- 只对 agent-host 会话生效。
+- 改 bundle 不是官方路径；**VS Code 升级会换 server commit，补丁失效**，`--check` 会发现，重跑即可。
+- 自定义模型没有 reasoning effort 选择器（§2.3②）。
+- 无 keyring 的机器上桥接不可用（`get(secretStorageService)` 会同步阻塞），用 §1.3 B 的明文方式。

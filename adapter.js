@@ -102,75 +102,23 @@ globalThis.__vscodeRemoteByok = (function () {
   /**
    * 密钥来源。
    *
-   * ⚠️ 先说清楚：VS Code 的设计是「文件里只放占位符，真值在 SecretStorage」。
-   * 但 agent host 是个精简的 utility 进程：bundle 里**没有** `secretStorageService` /
-   * `encryptionService`（grep 全为 0），所以它**无法**参与标准流程。
+   * 优先级：
+   *   1. VSCODE_BYOK_SECRETS_JSON   JSON 字符串 `{"chat.lm.secret.X":"值"}`，
+   *      由 server 侧桥接从 SecretStorage 解析后注入（需要 keyring）。
+   *   2. VSCODE_SECRET_<NAME>       环境变量，如
+   *      chat.lm.secret.ab12cd34 → VSCODE_SECRET_CHAT_LM_SECRET_AB12CD34
+   *   3. 配置文件里的明文 apiKey     —— 见下面的说明
    *
-   * 因此这里提供的是**补丁专用兜底**（不改变配置文件的标准性）：
-   * 真实密钥放在与该文件**同级**的 secrets 文件里（0600），由本适配器解析：
+   * 关于 3：VS Code 的核心解析器只接受 `${input:…}`，明文会被截断后当 key 名去
+   * SecretStorage 查 → 必然失效。但**本适配器是直接读文件的**，所以明文在我们的
+   * 代码路径上可用。这是无 keyring 主机上唯一可行的方式，代价是：
+   *   - 密钥以明文存在配置文件里
+   *   - 只有 agent-host 会话能用（普通 Chat 仍走 VS Code 的解析器，会拿不到）
    *
-   *   <配置文件目录>/chatLanguageModels.secrets.json
-   *   { "chat.lm.secret.XXXXXXXX": "真实密钥", ... }
-   *
-   * 也支持环境变量兜底：`VSCODE_SECRET_<占位符名转大写下划线>`，例如
-   *   chat.lm.secret.ab12cd34  →  VSCODE_SECRET_CHAT_LM_SECRET_AB12CD34
-   *
-   * 显式指定：VSCODE_REMOTE_BYOK_SECRETS=/path/to/secrets.json
-   */
-  const secretsCache = { file: null, map: null, tried: [] };
-
-  function secretsPaths() {
-    if (secretsCache.tried.length) return secretsCache.tried;
-    const out = [];
-    if (process.env.VSCODE_REMOTE_BYOK_SECRETS) out.push(process.env.VSCODE_REMOTE_BYOK_SECRETS);
-    // 与配置文件同级的 secrets 文件，两种命名都认：
-    //   chatLanguageModels.secrets.json               （标准名）
-    //   <配置文件去掉 .json>.secrets.json             （自定义文件名时更直观）
-    try {
-      for (const p of configPaths()) {
-        if (fs && fs.existsSync(p)) {
-          out.push(p.replace(/\.json$/i, '') + '.secrets.json');
-          out.push(p.replace(/\/[^/]*$/, '') + '/chatLanguageModels.secrets.json');
-          break;
-        }
-      }
-    } catch { /* ignore */ }
-    // 兜底：默认 data 目录
-    if (process.env.HOME) {
-      out.push(`${process.env.HOME}/.vscode-server/data/User/chatLanguageModels.secrets.json`);
-      out.push(`${process.env.HOME}/.vscode-server/data/Machine/chatLanguageModels.secrets.json`);
-    }
-    secretsCache.tried = out;
-    return out;
-  }
-
-  function loadSecrets() {
-    if (secretsCache.map) return secretsCache.map;
-    const map = Object.create(null);
-    for (const p of secretsPaths()) {
-      try {
-        if (fs && fs.existsSync(p)) {
-          const parsed = JSON.parse(fs.readFileSync(p, 'utf8'));
-          for (const k of Object.keys(parsed)) {
-            if (typeof parsed[k] === 'string') map[k] = parsed[k];
-          }
-          secretsCache.file = p;
-          log(`secrets loaded from ${p} (${Object.keys(parsed).length} entries)`);
-          break;
-        }
-      } catch (e) { log(`secrets parse failed: ${p}: ${e.message}`); }
-    }
-    secretsCache.map = map;
-    return map;
-  }
-
-  /**
-   * 解析一个 secret 名。按下面顺序（前两个给"上层注入"用，最后一个是本补丁的兜底）：
-   *   1. VSCODE_BYOK_SECRETS_JSON   e.g. '{"chat.lm.secret.x":"..."}'（可由启动 wrapper 注入）
-   *   2. VSCODE_SECRET_<NAME>       e.g. VSCODE_SECRET_CHAT_LM_SECRET_X
-   *   3. <配置同级>/chatLanguageModels.secrets.json（本补丁扩展，非 VS Code 设计）
+   * 三者都没有就记入 `missingSecrets` 并跳过该模型（不会静默 401）。
    */
   let inlineSecrets;   // undefined = 还没解析过
+
   function loadedInlineSecrets() {
     if (inlineSecrets !== undefined) return inlineSecrets;
     inlineSecrets = Object.create(null);
@@ -181,7 +129,7 @@ globalThis.__vscodeRemoteByok = (function () {
         for (const k of Object.keys(parsed)) {
           if (typeof parsed[k] === 'string') inlineSecrets[k] = parsed[k];
         }
-        log(`inline secrets from VSCODE_BYOK_SECRETS_JSON (${Object.keys(inlineSecrets).length} entries)`);
+        log(`inline secrets: ${Object.keys(inlineSecrets).length} entr(ies) from VSCODE_BYOK_SECRETS_JSON`);
       } catch (e) { log('VSCODE_BYOK_SECRETS_JSON parse failed: ' + e.message); }
     }
     return inlineSecrets;
@@ -191,8 +139,6 @@ globalThis.__vscodeRemoteByok = (function () {
     if (!name) return undefined;
     const inline = loadedInlineSecrets()[name];
     if (typeof inline === 'string' && inline.trim()) return inline.trim();
-    const fromFile = loadSecrets()[name];
-    if (typeof fromFile === 'string' && fromFile.trim()) return fromFile.trim();
     const envKey = 'VSCODE_SECRET_' + name.replace(/[^A-Za-z0-9]/g, '_').toUpperCase();
     const fromEnv = process.env[envKey];
     if (typeof fromEnv === 'string' && fromEnv.trim()) return fromEnv.trim();
@@ -201,8 +147,8 @@ globalThis.__vscodeRemoteByok = (function () {
 
   /**
    * 从分组/模型里取认证信息。支持四种写法（推荐第 1 种，即 VS Code 标准格式）：
-   *   1. apiKey: "${input:chat.lm.secret.X}"   → 由 secrets 文件/环境变量解析
-   *   2. apiKey: "YOUR-API-KEY"                      → 明文（能用，但文件里就有密钥）
+   *   1. apiKey: "${input:chat.lm.secret.X}"   → 由上面的两个来源解析
+   *   2. apiKey: "YOUR-API-KEY"                → 明文（能用，但文件里就有密钥）
    *   3. requestHeaders: { authorization: "Bearer ${apiKey}" }  → 用解析后的 apiKey 填充
    *   4. requestHeaders: { authorization: "Bearer YOUR-API-KEY" }     → 明文头
    */
@@ -265,7 +211,7 @@ globalThis.__vscodeRemoteByok = (function () {
   let nativeActive = false;
 
   function build() {
-    const result = { models: [], providers: [], nameByModel: new Map(), ids: new Set(), selectionIds: new Set(), file: null, error: undefined, skipped: [], missingSecrets: [], secretsFile: null };
+    const result = { models: [], providers: [], nameByModel: new Map(), ids: new Set(), selectionIds: new Set(), file: null, error: undefined, skipped: [], missingSecrets: [] };
     if (!fs) { result.error = 'no fs'; return result; }
 
     let raw = null;
@@ -341,7 +287,7 @@ globalThis.__vscodeRemoteByok = (function () {
         }
         if (auth.missingSecret) {
           result.missingSecrets.push(auth.missingSecret);
-          result.skipped.push(`${g.name}/${m.id}: apiKey 占位符未解析 —— 缺少 ${auth.missingSecret}（见 chatLanguageModels.secrets.json）`);
+          result.skipped.push(`${g.name}/${m.id}: apiKey 占位符未解析 —— 缺少 ${auth.missingSecret}（见 README「密钥」）`);
         }
         if (!auth.apiKey && !auth.headers) result.skipped.push(`${g.name}/${m.id}: 没有可用凭据，该模型会 401`);
 
@@ -399,7 +345,6 @@ globalThis.__vscodeRemoteByok = (function () {
       }
     }
 
-    result.secretsFile = secretsCache.file;
     result.missingSecrets = [...new Set(result.missingSecrets)];
     result.providers = result.providers.map(({ __key, ...p }) => p);
     return result;
@@ -432,7 +377,6 @@ globalThis.__vscodeRemoteByok = (function () {
         modelIds: c.models.map((m) => m.modelIdentifier),
         providerNames: c.providers.map((p) => p.name),
         nativeActive,
-        secretsFile: c.secretsFile,
         missingSecrets: c.missingSecrets || [],
       };
     },
