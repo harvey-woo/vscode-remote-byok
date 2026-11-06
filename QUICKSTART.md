@@ -86,6 +86,16 @@ agent host 日志里出现下面这行就说明真的走了我们的 provider：
 [Copilot:…] Using custom provider: type=openai, baseUrl=https://api.example.com/v1, wireApi=completions
 ```
 
+## 本机开发要不要打这个补丁？
+
+**不需要。** 本机（不是 Remote-SSH）的 agent host 是 utility process，原生 BYOK 桥是好的。
+适配器在那种情况下会**完全让位**（`registry.getModels()` 非空即静默），
+所以即使打了补丁也不会产生重复 provider、也不会影响原生行为。
+
+判定很简单：看日志 `describe().nativeActive`，或直接看
+`/tmp/vscode-remote-byok.log` 里有没有 `models=N`（你文件里的模型数）——
+本机有原生模型时，我们不会把自己那份塞进去。
+
 ## 出问题看这里
 
 | 现象 | 去看 |

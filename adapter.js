@@ -250,6 +250,20 @@ globalThis.__vscodeRemoteByok = (function () {
   let cache = null;
   let lastError = null;
 
+  /**
+   * 原生 BYOK 桥是否在工作。
+   *
+   * **这是本补丁最重要的开关。** 本机（agent host = utility process）原生桥是好的，
+   * 我们的适配器在那里必须**完全让位**，否则：
+   *   - 合并两边模型 → 同一模型出现两个 id（vendor 被重命名时尤其明显）= 重复 provider
+   *   - 用我们的直连端点覆盖原生 provider → 丢掉 loopback proxy + nonce → 原生 BYOK 坏掉
+   *   - isOurs() 命中原生模型 → 把它们的 reasoningEffort 也清零 → 功能退化
+   *
+   * 判定：`registry.getModels()` 返回非空 = 原生桥在工作。
+   * 每次调用时**动态**判断（renderer 可能晚于 agent host 启动才推模型）。
+   */
+  let nativeActive = false;
+
   function build() {
     const result = { models: [], providers: [], nameByModel: new Map(), ids: new Set(), selectionIds: new Set(), file: null, error: undefined, skipped: [], missingSecrets: [], secretsFile: null };
     if (!fs) { result.error = 'no fs'; return result; }
@@ -417,6 +431,7 @@ globalThis.__vscodeRemoteByok = (function () {
         error: c.error, skipped: c.skipped, lastError,
         modelIds: c.models.map((m) => m.modelIdentifier),
         providerNames: c.providers.map((p) => p.name),
+        nativeActive,
         secretsFile: c.secretsFile,
         missingSecrets: c.missingSecrets || [],
       };
@@ -437,6 +452,8 @@ globalThis.__vscodeRemoteByok = (function () {
     isOurs(modelId) {
       try {
         if (typeof modelId !== 'string' || !modelId) return false;
+        // 原生桥在工作时，这些模型由原生 provider 服务，不该被我们改行为
+        if (nativeActive) return false;
         const c = ensure();
         if (c.ids.has(modelId) || c.selectionIds.has(modelId)) return true;
         // 容错：调用点可能拿到的是剥掉 provider 前缀后的 `<group>/<id>`。
@@ -445,16 +462,28 @@ globalThis.__vscodeRemoteByok = (function () {
       } catch { return false; }
     },
 
-    /** 把模型的 provider 查成我们合成出来的 provider 名 */
+    /** 把模型的 provider 查成我们合成出来的 provider 名（原生在用时保持原生 vendor 不变） */
     providerFor(model) {
+      if (nativeActive) return model && model.vendor;
       const c = ensure();
       try {
         return c.nameByModel.get(keyOf(model)) || model.vendor;
-      } catch (e) { lastError = String(e && e.message); return model.vendor; }
+      } catch (e) { lastError = String(e && e.message); return model && model.vendor; }
     },
 
-    /** znt() 需要的那份 providers（只返回本轮真正用到的） */
-    providers(models) {
+    /**
+     * znt() 需要的那份 providers。
+     *
+     * @param models   本轮的模型列表（即 getModels() 的结果）
+     * @param fallback 原生桥在用时调用它 —— 那正是 agent host 原本的 provider 构造
+     *                 （指向 loopback proxy + nonce bearer），必须原样交还，
+     *                 否则原生 BYOK 会因为我们给了直连端点而失效。
+     */
+    providers(models, fallback) {
+      if (nativeActive) {
+        try { return typeof fallback === 'function' ? fallback() : (fallback || []); }
+        catch (e) { lastError = String(e && e.message); return []; }
+      }
       const c = ensure();
       try {
         const want = new Set((models || []).map((m) => this.providerFor(m)));
@@ -470,10 +499,10 @@ globalThis.__vscodeRemoteByok = (function () {
         registry.getModels = function () {
           let base = [];
           try { base = [...(orig() || [])]; } catch { /* ignore */ }
-          const extra = ensure().models;
-          if (base.length === 0) return extra;
-          const seen = new Set(base.map((m) => keyOf(m)));
-          return base.concat(extra.filter((m) => !seen.has(keyOf(m))));
+          // 原生桥给了模型 → 我们完全让位（不合并！合并会产生重复 provider）
+          nativeActive = base.length > 0;
+          if (nativeActive) return base;
+          return ensure().models;
         };
         Object.defineProperty(registry, '__vscodeRemoteByok', { value: true, enumerable: false });
         ensure();

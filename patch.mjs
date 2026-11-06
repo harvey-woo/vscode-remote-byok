@@ -150,9 +150,13 @@ function patchAgentHost(source) {
   const adapter = read(ADAPTER);
   if (!adapter.includes(MARK)) throw new Error('adapter.js 里没有 ' + MARK);
 
+  // 原生桥在用时必须交还原生的 provider 构造（指向 loopback proxy + nonce bearer），
+  // 所以把原始表达式作为 fallback thunk 传进去，而不是简单替换掉。
+  const provOriginal = provSeg.replace(/^let a=/, '').replace(/,$/, '');   // `[...].map(...)`
+
   const edits = [
     { at: headerEnd + 2, len: 0, text: `\n${adapter}\n` },
-    { at: provStart, len: provSeg.length, text: `let a=${MARK}.providers(n),` },
+    { at: provStart, len: provSeg.length, text: `let a=${MARK}.providers(n,()=>${provOriginal}),` },
     { at: modelsAt, len: MODELS_PREFIX.length, text: `d=n.map(l=>({id:m_(l),provider:${MARK}.providerFor(l),` },
     { at: ctorMatch.index, len: ctorMatch[0].length, text: `${ctorMatch[0]},${regIdent}=${MARK}.wrap(${regIdent})` },
     { at: source.indexOf(BQ_DEF), len: BQ_DEF.length, text: `${BQ_DEF}if(${MARK}.isOurs(o?.id))return void 0;` },
@@ -164,7 +168,7 @@ function patchAgentHost(source) {
 
   const expect = [
     ['适配器', MARK],
-    ['providers 段', `${MARK}.providers(n)`],
+    ['providers 段', `${MARK}.providers(n,()=>`],
     ['models 段', `${MARK}.providerFor(l)`],
     ['registry 包装', `${MARK}.wrap(${regIdent})`],
     ['reasoning 拦截', `${BQ_DEF}if(${MARK}.isOurs(o?.id))return void 0;`],
