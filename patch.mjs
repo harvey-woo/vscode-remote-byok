@@ -39,6 +39,7 @@ const BRIDGE = path.join(HERE, 'server-bridge.js');
 
 const MARK = 'globalThis.__vscodeRemoteByok';
 const SERVER_MARK = 'globalThis.__vscodeRemoteByokServer';
+const CS_MARK = 'VSCODE_REMOTE_BYOK_SHARE_USER_DATA';
 
 const args = process.argv.slice(2);
 const argValue = (n, d) => { const i = args.indexOf(n); return i >= 0 && args[i + 1] ? args[i + 1] : d; };
@@ -47,6 +48,13 @@ const CHECK = args.includes('--check');
 const REVERT = args.includes('--revert');
 const DRY = args.includes('--dry-run');
 const FORCE = args.includes('--force');
+// --share-user-data [dir]：让远程 server 与桌面共用同一个 user data 目录，
+// 这样 chatLanguageModels.json / settings.json 等只有一份。省略 dir 时自动探测。
+const SHARE_USER_DATA = args.includes('--share-user-data')
+  ? (args[args.indexOf('--share-user-data') + 1] && !args[args.indexOf('--share-user-data') + 1].startsWith('--')
+      ? args[args.indexOf('--share-user-data') + 1]
+      : 'auto')
+  : null;
 
 if (!SERVER_DIR) {
   console.error('用法: node patch.mjs --server-dir <server bundle 根目录> [--check|--revert|--dry-run|--force]');
@@ -56,6 +64,7 @@ if (!SERVER_DIR) {
 
 const AGENT = path.join(SERVER_DIR, 'out/vs/platform/agentHost/node/agentHostMain.js');
 const SERVER = path.join(SERVER_DIR, 'out/server-main.js');
+const CS_WRAPPER = path.join(SERVER_DIR, 'bin/code-server');
 const MARKER = path.join(SERVER_DIR, '.vscode-remote-byok.json');
 
 const version = (() => { try { return JSON.parse(fs.readFileSync(path.join(SERVER_DIR, 'product.json'), 'utf8')).version; } catch { return 'unknown'; } })();
@@ -74,8 +83,11 @@ const isPatched = (f, mark) => read(f).includes(mark);
 
 // ── --revert ───────────────────────────────────────────────────────────────
 if (REVERT) {
-  for (const f of [AGENT, SERVER]) {
-    if (!fs.existsSync(`${f}.orig`)) { console.error(`没有备份 ${f}.orig，无法回滚`); process.exit(1); }
+  for (const f of [AGENT, SERVER, CS_WRAPPER]) {
+    if (!fs.existsSync(`${f}.orig`)) {
+      if (f === CS_WRAPPER) continue;   // C 段可选，没打过就没有备份
+      console.error(`没有备份 ${f}.orig，无法回滚`); process.exit(1);
+    }
     fs.copyFileSync(`${f}.orig`, f);
     fs.rmSync(`${f}.orig`, { force: true });
   }
@@ -88,12 +100,14 @@ if (REVERT) {
 if (CHECK) {
   const a = isPatched(AGENT, MARK);
   const b = isPatched(SERVER, SERVER_MARK);
-  if (a && b) {
-    console.log(`✅ 已打补丁（agent host + server）  ${label}`);
+  const c = fs.existsSync(CS_WRAPPER) && isPatched(CS_WRAPPER, CS_MARK);
+  const wantC = !!SHARE_USER_DATA;
+  if (a && b && (!wantC || c)) {
+    console.log(`✅ 已打补丁（agent host + server${c ? ' + 共用 user data' : ''}）  ${label}`);
     process.exit(0);
   }
   console.log(`❌ 未完整打补丁  ${label}`);
-  console.log(`   agent host: ${a ? '已打' : '未打'}   server: ${b ? '已打' : '未打'}`);
+  console.log(`   agent host: ${a ? '已打' : '未打'}   server: ${b ? '已打' : '未打'}   共用 user data: ${c ? '已启用' : '未启用'}${wantC && !c ? '（本次要求启用）' : ''}`);
   const prev = fs.existsSync(MARKER) ? JSON.parse(read(MARKER)) : undefined;
   if (prev?.version && prev.version !== version) {
     console.log(`   原因很可能是 VS Code 升级：补丁是给 ${prev.version} 打的，现在已是 ${version}`);
@@ -111,6 +125,18 @@ if (!FORCE && isPatched(AGENT, MARK) && isPatched(SERVER, SERVER_MARK)) {
   fs.writeFileSync(MARKER, JSON.stringify({ version, patchedAt: new Date().toISOString() }, null, 2));
   console.log(`已经打过补丁（${label}），跳过（重打用 --force）`);
   process.exit(0);
+}
+
+/** --share-user-data 的目标目录；auto 时探测桌面 user data */
+function resolveShareDir(spec) {
+  if (spec === 'auto') {
+    const home = process.env.HOME || '';
+    for (const d of [`${home}/.config/Code`, `${home}/Library/Application Support/Code`]) {
+      if (fs.existsSync(d)) return d;
+    }
+    throw new Error('未找到桌面 user data 目录（~/.config/Code 或 ~/Library/Application Support/Code）');
+  }
+  return spec;
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -251,8 +277,27 @@ function patchServerMain(source) {
   return { out, meta: { starter, diVar, token, chunkVar, createInstanceSites: ciHits.length } };
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// C. bin/code-server（可选：与桌面共用 user data）
+// ══════════════════════════════════════════════════════════════════════════
+function patchCodeServerWrapper(source, dir) {
+  const LAST = '"$ROOT/node" ${INSPECT:-} "$ROOT/out/server-main.js" "$@"';
+  if (!source.includes(LAST)) throw new Error('code-server 末行形态不符');
+  const inject = [
+    `# ${CS_MARK}: 与桌面共用 user data（--share-user-data 生成）`,
+    'if [ -z "${VSCODE_REMOTE_BYOK_NO_SHARE_USER_DATA:-}" ]; then',
+    '\tcase " $* " in',
+    '\t\t*" --user-data-dir "*) ;;',
+    `\t\t*) set -- --user-data-dir "${dir}" "$@" ;;`,
+    '\tesac',
+    'fi',
+    LAST,
+  ].join('\n');
+  return source.replace(LAST, inject);
+}
+
 // ── dry-run 且已打过：直接报告，别去定位（原字符串已被替换过）────────────
-if (DRY && !FORCE && isPatched(AGENT, MARK) && isPatched(SERVER, SERVER_MARK)) {
+if (DRY && !FORCE && isPatched(AGENT, MARK) && isPatched(SERVER, SERVER_MARK) && !SHARE_USER_DATA) {
   console.log(`server bundle  : ${SERVER_DIR}  (${label})`);
   console.log('已是补丁状态（重打用 --force）');
   process.exit(0);
@@ -308,7 +353,30 @@ if (!isPatched(SERVER, SERVER_MARK)) {
   console.log('B. server-main 已是补丁状态，跳过');
 }
 
-fs.writeFileSync(MARKER, JSON.stringify({ version, patchedAt: new Date().toISOString(), target: SERVER_DIR }, null, 2));
+// C 段（可选）
+if (SHARE_USER_DATA) {
+  const dir = resolveShareDir(SHARE_USER_DATA);
+  let csSrc = read(CS_WRAPPER);
+  if (FORCE && fs.existsSync(`${CS_WRAPPER}.orig`)) csSrc = read(`${CS_WRAPPER}.orig`);
+  if (csSrc.includes(CS_MARK) && !FORCE) {
+    console.log(`C. code-server 已配置共用 user data（${dir}），跳过`);
+  } else {
+    if (!fs.existsSync(`${CS_WRAPPER}.orig`)) fs.copyFileSync(CS_WRAPPER, `${CS_WRAPPER}.orig`);
+    fs.writeFileSync(CS_WRAPPER, patchCodeServerWrapper(csSrc, dir));
+    fs.chmodSync(CS_WRAPPER, 0o755);
+    const chk = spawnSync('sh', ['-n', CS_WRAPPER], { encoding: 'utf8' });
+    if (chk.status !== 0) {
+      console.error('C 段语法校验失败，回滚');
+      console.error(chk.stderr);
+      fs.copyFileSync(`${CS_WRAPPER}.orig`, CS_WRAPPER);
+      process.exit(1);
+    }
+    console.log(`C. 已让 server 与桌面共用 user data：${dir}  语法 ✓`);
+    console.log('   重启 server 后生效；不想要了就 --revert');
+  }
+}
+
+fs.writeFileSync(MARKER, JSON.stringify({ version, patchedAt: new Date().toISOString(), target: SERVER_DIR, shareUserData: SHARE_USER_DATA ? resolveShareDir(SHARE_USER_DATA) : null }, null, 2));
 console.log('');
 console.log('生效：');
 console.log('  A 段（agent host） → 需 agent host 重启（重载/重连窗口）');

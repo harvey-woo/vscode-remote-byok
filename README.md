@@ -123,6 +123,9 @@ cat /tmp/vscode-remote-byok.log
 "$NODE" patch.mjs --server-dir "$S" --force    # 改了 adapter/bridge 后重打
 "$NODE" patch.mjs --server-dir "$S" --revert   # 回滚
 "$NODE" patch.mjs --server-dir "$S" --dry-run  # 只报告注入点
+
+# 让远程 server 与桌面共用同一个 user data 目录（配置/设置只有一份）
+"$NODE" patch.mjs --server-dir "$S" --share-user-data
 ```
 
 ## 8. 本机开发（不是 Remote-SSH）
@@ -130,14 +133,21 @@ cat /tmp/vscode-remote-byok.log
 不用打补丁。本机 agent host 是 utility process，原生 BYOK 正常。
 （打了也不影响：适配器是纯兜底，原生有模型时完全让位。）
 
-**想让同一台机器上的「桌面 VS Code」和「Remote-SSH」共用一份配置**，
-把 server 那份做成指向桌面的软链接（两个路径由 VS Code 决定，只能这样合并）：
+**想让「桌面 VS Code」和「Remote-SSH」共用同一份配置**：加一个参数即可。
 
 ```bash
-ln -sf ~/.config/Code/User/chatLanguageModels.json \
-       ~/.vscode-server/data/User/chatLanguageModels.json
-# macOS 桌面路径换成 ~/Library/Application Support/Code/User/
+"$NODE" patch.mjs --server-dir "$S" --share-user-data
 ```
+
+它会给 `bin/code-server` 注入 `--user-data-dir <桌面目录>`（自动探测
+`~/.config/Code` 或 `~/Library/Application Support/Code`）。之后 server 与桌面
+**用同一个 user data 目录**，`chatLanguageModels.json` 只有一份。
+
+代价：不只是这个文件，`settings.json`、`keybindings.json`、`globalStorage/`
+（含 Copilot 登录态与缓存）、`workspaceStorage/`、`logs/` 也一起共享。
+扩展目录仍分离（`~/.vscode-server/extensions` vs `~/.vscode/extensions`）。
+
+不想要了：`--revert` 会连 `bin/code-server` 一起还原。
 
 ---
 
@@ -181,6 +191,7 @@ reasoning 能力校验，都在适配器内部完成，**配置里不用管**。
 | --- | --- | --- |
 | `agentHostMain.js` | 6 | 插入 adapter、包住 registry、改 providers/models、短路 BQ/GQ |
 | `server-main.js` | 3 | 插入 bridge、挂 DI、在 start() 里解析占位符注入 env（`VSCODE_BYOK_BRIDGE=1` 才启用，见 §3 A） |
+| `bin/code-server` | 1 | 可选：注入 `--user-data-dir`，让远程与桌面共用 user data（`--share-user-data`） |
 
 ## 2.3 密钥为什么这么别扭
 
