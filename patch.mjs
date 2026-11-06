@@ -190,7 +190,7 @@ function patchAgentHost(source) {
     { at: modelsAt, len: MODELS_PREFIX.length, text: `d=n.map(l=>({id:m_(l),provider:${MARK}.providerFor(l),` },
     { at: capAt, len: CAP_PREFIX.length, text: `...${MARK}.capabilitiesFor(l)` },
     { at: ctorMatch.index, len: ctorMatch[0].length, text: `${ctorMatch[0]},${regIdent}=${MARK}.wrap(${regIdent})` },
-    { at: source.indexOf(BQ_DEF), len: BQ_DEF.length, text: `${BQ_DEF}if(${MARK}.isOurs(o?.id))return void 0;` },
+    { at: source.indexOf(BQ_DEF), len: BQ_DEF.length, text: `${BQ_DEF}var __vrbEffort=lAe(o,dAe(o,i,e,t)??qnt(o));${MARK}.recordReasoning(o?.id,__vrbEffort);return __vrbEffort;` },
     { at: source.indexOf(GQ_DEF), len: GQ_DEF.length, text: `${GQ_DEF}if(${MARK}.isOurs(o?.id))return void 0;` },
   ].sort((x, y) => y.at - x.at);
 
@@ -203,7 +203,7 @@ function patchAgentHost(source) {
     ['models 段', `${MARK}.providerFor(l)`],
     ['capabilities 段', `${MARK}.capabilitiesFor(l)`],
     ['registry 包装', `${MARK}.wrap(${regIdent})`],
-    ['reasoning 拦截', `${BQ_DEF}if(${MARK}.isOurs(o?.id))return void 0;`],
+    ['reasoning 观测', `${MARK}.recordReasoning(o?.id,__vrbEffort)`],
     ['contextTier 拦截', `${GQ_DEF}if(${MARK}.isOurs(o?.id))return void 0;`],
   ];
   for (const [what, needle] of expect) if (!out.includes(needle)) throw new Error(`A 段注入失败：${what}`);

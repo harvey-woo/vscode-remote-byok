@@ -321,18 +321,30 @@ globalThis.__vscodeRemoteByok = (function () {
         seenSelection.add(selectionId);
 
         const modelIdentifier = `${v}/${selectionId}`;
-        // 配置里的 supportsReasoningEffort 在这里**不下发**：agent host 侧无法让它真正生效
-        // （SDK 会用官方模型目录校验），下发只会让界面出现一个选了却没作用的选择器。
-        // 配置文件仍可与本地完全一致，适配器只是在发布模型时省略该能力。
-        const efforts = undefined;
+        // 配置里声明了 reasoning 能力就下发，让界面与本地一致。
+        // 代价：SDK 会按 capabilityModelId 去官方模型目录校验；我们靠 capabilitiesFor
+        // 把能力覆盖进 model metadata 来争取它接受（见 patch 的 capabilities 注入）。
+        const efforts = Array.isArray(m.supportsReasoningEffort)
+          ? m.supportsReasoningEffort.filter((x) => typeof x === 'string')
+          : undefined;
+        const inputTok = typeof m.maxInputTokens === 'number' ? m.maxInputTokens : undefined;
+        const outputTok = typeof m.maxOutputTokens === 'number' ? m.maxOutputTokens : undefined;
+        const ctxWindow = typeof m.contextWindow === 'number'
+          ? m.contextWindow
+          : (inputTok !== undefined || outputTok !== undefined)
+            ? (inputTok ?? 0) + (outputTok ?? 0)
+            : undefined;
+
         const info = {
           vendor: v,
           id: m.id,
           ...(m.name ? { name: m.name } : {}),
           modelIdentifier,
-          ...(typeof m.maxInputTokens === 'number' ? { maxContextWindowTokens: m.maxInputTokens, maxPromptTokens: m.maxInputTokens } : {}),
-          ...(typeof m.contextWindow === 'number' && typeof m.maxInputTokens !== 'number' ? { maxContextWindowTokens: m.contextWindow } : {}),
-          ...(typeof m.maxOutputTokens === 'number' ? { maxOutputTokens: m.maxOutputTokens } : {}),
+          // 与 VS Code 的 NTn() 对齐：contextWindow = contextWindow ?? maxInputTokens + maxOutputTokens。
+          // 之前这里直接填 maxInputTokens，导致远程显示 450K 而本地显示 514K。
+          ...(ctxWindow !== undefined ? { maxContextWindowTokens: ctxWindow } : {}),
+          ...(inputTok !== undefined ? { maxPromptTokens: inputTok } : {}),
+          ...(outputTok !== undefined ? { maxOutputTokens: outputTok } : {}),
           supportsVision: m.vision === true,
           ...(efforts && efforts.length ? { supportedReasoningEfforts: efforts } : {}),
           ...(typeof m.reasoningEffort === 'string' ? { defaultReasoningEffort: m.reasoningEffort } : {}),
@@ -381,6 +393,17 @@ globalThis.__vscodeRemoteByok = (function () {
     },
 
     /**
+     * 观测点：BQ() 算出来的 reasoningEffort 是什么。
+     * 它的返回值会直接进 `client.createSession({ reasoningEffort: BQ(...) })`，
+     * 所以这里记下来就等于知道「有没有传给 SDK、值是多少」。
+     */
+    recordReasoning(modelId, effort) {
+      try {
+        log(`reasoning: model=${modelId} -> ${effort === undefined ? '(不传)' : JSON.stringify(effort)}`);
+      } catch { /* ignore */ }
+    },
+
+    /**
      * 这个客户端模型 id 是不是我们注入的？
      *
      * 用途：agent host 在 `createSession` 时会把模型配置里的 thinkingLevel/contextSize
@@ -401,7 +424,10 @@ globalThis.__vscodeRemoteByok = (function () {
         if (c.ids.has(modelId) || c.selectionIds.has(modelId)) return true;
         // 容错：调用点可能拿到的是剥掉 provider 前缀后的 `<group>/<id>`。
         const slash = modelId.indexOf('/');
-        return slash > 0 && c.selectionIds.has(modelId.slice(slash + 1));
+        if (slash > 0 && c.selectionIds.has(modelId.slice(slash + 1))) return true;
+        // 再兜一层：只剩裸模型 id（<id>）。
+        const bare = modelId.split('/').pop();
+        return c.models.some((m) => m.id === bare);
       } catch { return false; }
     },
 
