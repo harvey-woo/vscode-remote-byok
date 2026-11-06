@@ -321,13 +321,10 @@ globalThis.__vscodeRemoteByok = (function () {
         seenSelection.add(selectionId);
 
         const modelIdentifier = `${v}/${selectionId}`;
-        // ⚠️ 不要下发 reasoning effort 能力：SDK 侧元数据按 capabilityModelId 查官方模型目录，
-        // 自定义模型不在目录里 → 结论是「不支持 reasoning effort」；若这里却告诉客户端「支持」，
-        // 客户端会带上 reasoningEffort，会话构造直接失败。
-        // （补丁另外在 BQ/GQ 里做了强制短路，这里是第二道保险。）
-        if (Array.isArray(m.supportsReasoningEffort)) {
-          result.skipped.push(`${groupName}/${m.id}: 忽略 supportsReasoningEffort（SDK 侧元数据不认自定义模型）`);
-        }
+        // 配置里的 supportsReasoningEffort 在这里**不下发**：agent host 侧无法让它真正生效
+        // （SDK 会用官方模型目录校验），下发只会让界面出现一个选了却没作用的选择器。
+        // 配置文件仍可与本地完全一致，适配器只是在发布模型时省略该能力。
+        const efforts = undefined;
         const info = {
           vendor: v,
           id: m.id,
@@ -337,6 +334,8 @@ globalThis.__vscodeRemoteByok = (function () {
           ...(typeof m.contextWindow === 'number' && typeof m.maxInputTokens !== 'number' ? { maxContextWindowTokens: m.contextWindow } : {}),
           ...(typeof m.maxOutputTokens === 'number' ? { maxOutputTokens: m.maxOutputTokens } : {}),
           supportsVision: m.vision === true,
+          ...(efforts && efforts.length ? { supportedReasoningEfforts: efforts } : {}),
+          ...(typeof m.reasoningEffort === 'string' ? { defaultReasoningEffort: m.reasoningEffort } : {}),
         };
         result.models.push(info);
         result.nameByModel.set(modelIdentifier, provider.name);
@@ -433,6 +432,24 @@ globalThis.__vscodeRemoteByok = (function () {
         const want = new Set((models || []).map((m) => this.providerFor(m)));
         return c.providers.filter((p) => want.has(p.name));
       } catch (e) { lastError = String(e && e.message); return []; }
+    },
+
+    /**
+     * znt() 里 `capabilities` 的值。
+     *
+     * 原始表达式是 `...l.supportsVision!==void 0?{capabilities:{supports:{vision:l.supportsVision}}}:{}`，
+     * 它只声明 vision。SDK 的模型元数据由 `modelCreateProviderModelMetadata` 合成，
+     * 其中 `capabilitiesOverrideJson` 只有从 model info 的 `capabilities` 才会带过去。
+     * 所以把 reasoningEffort 也声明上，SDK 才不会去官方模型目录查、判定「不支持」。
+     */
+    capabilitiesFor(model) {
+      try {
+        const supports = {};
+        if (model && model.supportsVision !== undefined) supports.vision = model.supportsVision;
+        const efforts = model && model.supportedReasoningEfforts;
+        if (Array.isArray(efforts) && efforts.length) supports.reasoningEffort = true;
+        return Object.keys(supports).length ? { capabilities: { supports } } : {};
+      } catch { return {}; }
     },
 
     /** 包住 agent host 里那个 ByokLmBridgeRegistry 实例，把 getModels 接上 */

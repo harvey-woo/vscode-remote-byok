@@ -158,6 +158,8 @@ function patchAgentHost(source) {
   const GQ_DEF = 'function GQ(o,i,e){';
   const PROV_PREFIX = 'let a=[...new Set(n.map(l=>l.vendor))]';
   const MODELS_PREFIX = 'd=n.map(l=>({id:m_(l),provider:l.vendor,';
+  // capabilities 只声明了 vision，reasoningEffort 需要补上，否则 SDK 会去官方目录校验
+  const CAP_PREFIX = '...l.supportsVision!==void 0?{capabilities:{supports:{vision:l.supportsVision}}}:{}';
 
   const provStart = source.indexOf(PROV_PREFIX);
   if (provStart < 0) throw new Error('没找到 providers 构造段（znt）');
@@ -167,6 +169,8 @@ function patchAgentHost(source) {
 
   const modelsAt = source.indexOf(MODELS_PREFIX);
   if (modelsAt < 0) throw new Error('没找到 models 的 provider 赋值段（znt）');
+  const capAt = source.indexOf(CAP_PREFIX);
+  if (capAt < 0) throw new Error('没找到 capabilities 段（znt）');
   if (!source.includes(BQ_DEF)) throw new Error('没找到 BQ');
   if (!source.includes(GQ_DEF)) throw new Error('没找到 GQ');
 
@@ -184,6 +188,7 @@ function patchAgentHost(source) {
     { at: headerEnd + 2, len: 0, text: `\n${adapter}\n` },
     { at: provStart, len: provSeg.length, text: `let a=${MARK}.providers(n,()=>${provOriginal}),` },
     { at: modelsAt, len: MODELS_PREFIX.length, text: `d=n.map(l=>({id:m_(l),provider:${MARK}.providerFor(l),` },
+    { at: capAt, len: CAP_PREFIX.length, text: `...${MARK}.capabilitiesFor(l)` },
     { at: ctorMatch.index, len: ctorMatch[0].length, text: `${ctorMatch[0]},${regIdent}=${MARK}.wrap(${regIdent})` },
     { at: source.indexOf(BQ_DEF), len: BQ_DEF.length, text: `${BQ_DEF}if(${MARK}.isOurs(o?.id))return void 0;` },
     { at: source.indexOf(GQ_DEF), len: GQ_DEF.length, text: `${GQ_DEF}if(${MARK}.isOurs(o?.id))return void 0;` },
@@ -196,6 +201,7 @@ function patchAgentHost(source) {
     ['适配器', MARK],
     ['providers 段', `${MARK}.providers(n,()=>`],
     ['models 段', `${MARK}.providerFor(l)`],
+    ['capabilities 段', `${MARK}.capabilitiesFor(l)`],
     ['registry 包装', `${MARK}.wrap(${regIdent})`],
     ['reasoning 拦截', `${BQ_DEF}if(${MARK}.isOurs(o?.id))return void 0;`],
     ['contextTier 拦截', `${GQ_DEF}if(${MARK}.isOurs(o?.id))return void 0;`],

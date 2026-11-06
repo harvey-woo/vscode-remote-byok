@@ -111,7 +111,7 @@ cat /tmp/vscode-remote-byok.log
 | --- | --- |
 | 选择器里没有模型 | 配置路径不对，或 `models=0` |
 | `400 The requested model is not supported` | 补丁未生效（回落官方 API） |
-| `does not support reasoning effort configuration` | 补丁未生效（进程还在跑旧代码） |
+| `does not support reasoning effort configuration` | 旧版补丁遗留；当前版本不会再报这个（见 §2.4） |
 | 401 / 未授权 | 密钥没解析到 → 看日志里的 `missingSecrets` |
 | 什么都没变 | 补丁没生效 → 对比进程启动时间与补丁 mtime |
 
@@ -171,7 +171,7 @@ Copilot SDK 的 provider 默认 `wireApi` 就是 `completions`，
 所以直连即可，**不需要回环代理，也不需要协议翻译**。
 
 端点归一化（`baseUrl` 给根地址、补 `/v1`）、provider 命名、以及绕开 SDK 对自定义模型的
-reasoning 能力校验，都在适配器内部完成，**配置里不用管**。
+以及 reasoning 能力的处理，都在适配器内部完成，**配置里不用管**（写上也不会报错）。
 
 共 9 处注入，两个文件：
 
@@ -197,6 +197,9 @@ _resolveConfiguration(){ if (secret) { name = decodeSecretKey(v); v = await secr
 
 - 只对 agent-host 会话生效。
 - 改 bundle 不是官方路径；**VS Code 升级会换 server commit，补丁失效**，`--check` 会发现，重跑即可。
-- 自定义模型不能选 reasoning effort（SDK 以官方模型目录校验该能力）。
+- **自定义模型没有 reasoning effort 选择器**：agent host 无法让该能力生效（SDK 按官方模型目录
+  校验自定义模型），下发只会出现一个选了没作用的下拉，所以适配器发布模型时省略它。
+  配置里的 `supportsReasoningEffort` / `settings.reasoningEffort` **可以保留**，
+  这样远程与本机可以是同一份 JSON —— 这是本补丁唯一无法与本地对齐的功能点。
 - 桥接（§3 A）要求：该机有可用 keyring，且你能把 `VSCODE_BYOK_BRIDGE=1` 送进 server 进程。
   无 keyring 时 `get(secretStorageService)` 还会同步阻塞，所以默认关闭。
