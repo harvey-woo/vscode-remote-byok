@@ -1,0 +1,9 @@
+# 真实密钥文件（示例文件 example.*.secrets.json 是占位符，可以提交）
+chatLanguageModels.secrets.json
+*.real.secrets.json
+*.local.json
+
+# 系统 / 编辑器
+.DS_Store
+*.log
+node_modules/

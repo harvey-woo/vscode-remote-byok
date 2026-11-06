@@ -1,0 +1,31 @@
+[
+  {
+    "name": "My Endpoint",
+    "vendor": "customendpoint",
+    "apiType": "chat-completions",
+    "apiKey": "${input:chat.lm.secret.0123456789}",
+    "models": [
+      {
+        "id": "my-model",
+        "name": "My Model",
+        "url": "https://api.example.com/v1",
+        "maxInputTokens": 400000,
+        "maxOutputTokens": 64000,
+        "vision": true
+      }
+    ]
+  },
+  {
+    "name": "Another Provider",
+    "vendor": "customendpoint",
+    "apiType": "chat-completions",
+    "apiKey": "${input:chat.lm.secret.abcdef0123}",
+    "models": [
+      {
+        "id": "another-model",
+        "name": "Another Model",
+        "url": "https://api.another.example.org/v1"
+      }
+    ]
+  }
+]
