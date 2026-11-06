@@ -116,8 +116,8 @@ cat /tmp/vscode-remote-byok.log
 | 现象 | 原因 |
 | --- | --- |
 | 选择器里没有模型 | 配置路径不对，或 `models=0` |
-| `400 The requested model is not supported` | 回落官方 API → §2.1 |
-| `does not support reasoning effort configuration` | 进程没换，还在跑旧代码 |
+| `400 The requested model is not supported` | 补丁未生效（回落官方 API） |
+| `does not support reasoning effort configuration` | 补丁未生效（进程还在跑旧代码） |
 | 401 / 未授权 | 密钥没解析到 → 看日志里的 `missingSecrets` |
 | 什么都没变 | 补丁没生效 → 对比进程启动时间与补丁 mtime |
 
@@ -169,6 +169,9 @@ const providers = ...map(vendor => ({
 Copilot SDK 的 provider 默认 `wireApi` 就是 `completions`，
 所以直连即可，**不需要回环代理，也不需要协议翻译**。
 
+端点归一化（`baseUrl` 给根地址、补 `/v1`）、provider 命名、以及绕开 SDK 对自定义模型的
+reasoning 能力校验，都在适配器内部完成，**配置里不用管**。
+
 共 9 处注入，两个文件：
 
 | 文件 | 处 | 内容 |
@@ -176,25 +179,7 @@ Copilot SDK 的 provider 默认 `wireApi` 就是 `completions`，
 | `agentHostMain.js` | 6 | 插入 adapter、包住 registry、改 providers/models、短路 BQ/GQ |
 | `server-main.js` | 3 | 插入 bridge、挂 DI、在 start() 里解析占位符注入 env（`VSCODE_BYOK_BRIDGE=1` 才启用） |
 
-## 2.3 三个坑
-
-**① provider 名必须等于 vendor**
-
-客户端 id 是 `${vendor}/${id}`，SDK 的 BYOK 键是 `${provider}/${id}`。
-不一致 → SDK 查不到 → 回落官方 API → `400`。
-所以多端点要改写 **vendor**，不能改 provider 名。
-
-**② reasoningEffort 必须压掉**
-
-`BQ()` 会把客户端带来的 `thinkingLevel` 翻成 `reasoningEffort` 传给 SDK；
-SDK 去官方模型目录查不到自定义模型 → 判定不支持 → 会话构造失败。
-补丁在 `BQ`/`GQ` 开头直接返回 `undefined`。
-
-**③ `baseUrl` 必须是根地址**
-
-SDK 自己拼 wire 路径，给全路径会变成 `…/chat/completions/chat/completions` → 404。
-
-## 2.4 密钥为什么这么别扭
+## 2.3 密钥为什么这么别扭
 
 VS Code 的配置只接受占位符，真值在 SecretStorage：
 
@@ -207,9 +192,9 @@ _resolveConfiguration(){ if (secret) { name = decodeSecretKey(v); v = await secr
 而 agent host 里没有 SecretStorage，只能由外部喂：桥接从 SecretStorage 解（需 keyring），
 或直接把明文写进文件（我们的代码路径能读，但只有 agent-host 生效）。
 
-## 2.5 限制
+## 2.4 限制
 
 - 只对 agent-host 会话生效。
 - 改 bundle 不是官方路径；**VS Code 升级会换 server commit，补丁失效**，`--check` 会发现，重跑即可。
-- 自定义模型没有 reasoning effort 选择器（§2.3②）。
+- 自定义模型不能选 reasoning effort（SDK 以官方模型目录校验该能力）。
 - 无 keyring 的机器上桥接不可用（`get(secretStorageService)` 会同步阻塞），用 §3 B 的明文方式。
