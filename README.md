@@ -131,10 +131,22 @@ cat /tmp/vscode-remote-byok.log
 "$NODE" patch.mjs --server-dir "$S" --dry-run  # 只报告注入点
 ```
 
-## 8. 本机需要吗
+## 8. 本机开发（不是 Remote-SSH）
 
-**不需要。** 本机 agent host 是 utility process，原生 BYOK 正常。
-适配器是**纯兜底**：原生有模型时就完全让位，不会重复也不会影响原生行为。
+**不用打补丁。** 本机 agent host 是 utility process，原生 BYOK 正常。
+（打了也不影响：适配器是纯兜底，原生有模型时完全让位。）
+
+**但配置和密钥不通用** —— 两边是完全独立的目录：
+
+| | 配置文件 | 密钥 |
+| --- | --- | --- |
+| 本机桌面 | `~/.config/Code/User/chatLanguageModels.json`<br>（macOS：`~/Library/Application Support/Code/User/`） | 本机 SecretStorage |
+| 远程 server | `~/.vscode-server/data/User/chatLanguageModels.json` | 见 §3 |
+
+所以：
+
+- **配置内容可以复用** —— 同一份 JSON 复制到另一边的路径即可
+- **密钥不能复用** —— SecretStorage 按机器隔离，要各自配一次
 
 ---
 
