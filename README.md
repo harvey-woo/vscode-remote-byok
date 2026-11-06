@@ -46,43 +46,37 @@ JSON
 
 ## 3. 给密钥
 
-`apiKey` 有两条路，取决于那台机器有没有 keyring。
+**默认用 B**（不加任何额外条件就能用）。A 是标准做法，但需要你能把环境变量送进 server 进程。
 
-**先判断**：`ls ~/.local/share/keyrings/` 有内容、且
-`~/.vscode-server/data/User/globalStorage/state.vscdb` 里有 `secret://chat.lm.secret.*`
-→ 有；否则没有（headless 服务器通常没有）。
-
-**A. 有 keyring：用 VS Code 自己的方式（推荐）**
-
-1. 远程窗口命令面板 `Manage Models` → 选中该 vendor 组 → 填 key
-   （key 进 SecretStorage，配置文件里仍是占位符）
-2. 打开桥接，让 server 把值注入 agent host：
-
-   ```bash
-   echo 'export VSCODE_BYOK_BRIDGE=1' >> ~/.vscode-server/server-env-setup
-   ```
-
-   > ⚠️ 这一句**只在部分构建里生效**（由启动脚本 source）。实测 VS Code Server 1.145
-   > 的 `bin/code-server` **不** source 它，ssh 非登录 shell 也不读 `.bashrc`/`.profile`。
-   > 如果你的机器不生效，就用下面的 B。
-
-**B. 没有 keyring：直接写明文 `apiKey`**
-
-适配器是直接读文件的，所以明文在我们的代码路径上可用：
+**B. 明文写进配置**（开箱可用）
 
 ```jsonc
 "apiKey": "YOUR-API-KEY"
 ```
 
-代价两条，想清楚再用：
+适配器直接读文件，所以明文在我们的代码路径上可用。代价两条：
 
-- 密钥以明文存在配置文件里
-- **只有 agent-host 会话能用**。普通 Chat 仍走 VS Code 的解析器
-  （`decodeSecretKey` 会把明文截断后当 key 名去查 SecretStorage），所以那边拿不到
+- 密钥以明文存在配置文件里（0600）
+- **只有 agent-host 会话能用**。普通 Chat 仍走 VS Code 的解析器，
+  它会把明文截断后当 key 名去查 SecretStorage → 拿不到
 
-为什么不能既标准又简单：VS Code 设计上密钥只存 SecretStorage，
-而远程 agent host 里**没有** SecretStorage（bundle 内 `secretStorageService` 为 0 处），
-所以它只能靠外部给它 —— 要么桥接从 SecretStorage 拿（需 keyring），要么明文放文件。
+**A. 用 SecretStorage**（需要 keyring + 能注入 env）
+
+1. 远程窗口命令面板 `Manage Models` → 选中该 vendor 组 → 填 key
+   （key 进 SecretStorage，配置文件里保持 `${input:...}` 占位符）
+2. 让 server 把值注入 agent host：需要给 server 进程设 `VSCODE_BYOK_BRIDGE=1`
+
+   ```bash
+   # 前提：有 ~/.local/share/keyrings/，且 state.vscdb 里能写入 secret://chat.lm.secret.*
+   echo 'export VSCODE_BYOK_BRIDGE=1' >> ~/.vscode-server/server-env-setup
+   ```
+
+   > 实测 VS Code Server 1.145 的 `bin/code-server` **不** source 这个文件，
+   > ssh 非登录 shell 也不读 `.bashrc` / `.profile`。所以这一句在很多机器上不生效 ——
+   > 你需要自己确认一种能把 env 送进 server 进程的方式（否则桥接不会启动）。
+
+为什么 B 存在：agent host 里**没有** SecretStorage（bundle 内 `secretStorageService` 为 0 处），
+而 VS Code 的配置解析器只认占位符，所以它只能靠外部喂 —— 要么桥接从 SecretStorage 拿，要么明文放文件。
 
 ## 4. 让补丁生效
 
@@ -136,6 +130,15 @@ cat /tmp/vscode-remote-byok.log
 不用打补丁。本机 agent host 是 utility process，原生 BYOK 正常。
 （打了也不影响：适配器是纯兜底，原生有模型时完全让位。）
 
+**想让同一台机器上的「桌面 VS Code」和「Remote-SSH」共用一份配置**，
+把 server 那份做成指向桌面的软链接（两个路径由 VS Code 决定，只能这样合并）：
+
+```bash
+ln -sf ~/.config/Code/User/chatLanguageModels.json \
+       ~/.vscode-server/data/User/chatLanguageModels.json
+# macOS 桌面路径换成 ~/Library/Application Support/Code/User/
+```
+
 ---
 
 # 二、原理
@@ -177,7 +180,7 @@ reasoning 能力校验，都在适配器内部完成，**配置里不用管**。
 | 文件 | 处 | 内容 |
 | --- | --- | --- |
 | `agentHostMain.js` | 6 | 插入 adapter、包住 registry、改 providers/models、短路 BQ/GQ |
-| `server-main.js` | 3 | 插入 bridge、挂 DI、在 start() 里解析占位符注入 env（`VSCODE_BYOK_BRIDGE=1` 才启用） |
+| `server-main.js` | 3 | 插入 bridge、挂 DI、在 start() 里解析占位符注入 env（`VSCODE_BYOK_BRIDGE=1` 才启用，见 §3 A） |
 
 ## 2.3 密钥为什么这么别扭
 
@@ -197,4 +200,5 @@ _resolveConfiguration(){ if (secret) { name = decodeSecretKey(v); v = await secr
 - 只对 agent-host 会话生效。
 - 改 bundle 不是官方路径；**VS Code 升级会换 server commit，补丁失效**，`--check` 会发现，重跑即可。
 - 自定义模型不能选 reasoning effort（SDK 以官方模型目录校验该能力）。
-- 无 keyring 的机器上桥接不可用（`get(secretStorageService)` 会同步阻塞），用 §3 B 的明文方式。
+- 桥接（§3 A）要求：该机有可用 keyring，且你能把 `VSCODE_BYOK_BRIDGE=1` 送进 server 进程。
+  无 keyring 时 `get(secretStorageService)` 还会同步阻塞，所以默认关闭。
