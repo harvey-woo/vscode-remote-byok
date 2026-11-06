@@ -42,6 +42,8 @@ cat > ~/.vscode-server/data/User/chatLanguageModels.json <<'JSON'
 JSON
 ```
 
+> `apiKey` 写成 `${input:...}` 还是明文，取决于 §3 选哪条路。
+
 ## 3. 给密钥
 
 `apiKey` 有两条路，取决于那台机器有没有 keyring。
@@ -152,7 +154,7 @@ if (server instanceof UtilityProcessServer) {        // Remote-SSH 走的是子�
 上游自己也这么写（`byokLmBridgeRegistry.ts`：*"…e.g. the remote agent host…"*），
 VS Code 还会主动弹窗提示 "BYOK models aren't supported in remote Copilot sessions"。
 
-## 2.2 补丁只做三件事
+## 2.2 补丁补的是哪两处输入
 
 `znt()`（会话配置合成）只有两个输入，补丁各补一半：
 
@@ -210,4 +212,4 @@ _resolveConfiguration(){ if (secret) { name = decodeSecretKey(v); v = await secr
 - 只对 agent-host 会话生效。
 - 改 bundle 不是官方路径；**VS Code 升级会换 server commit，补丁失效**，`--check` 会发现，重跑即可。
 - 自定义模型没有 reasoning effort 选择器（§2.3②）。
-- 无 keyring 的机器上桥接不可用（`get(secretStorageService)` 会同步阻塞），用 §1.3 B 的明文方式。
+- 无 keyring 的机器上桥接不可用（`get(secretStorageService)` 会同步阻塞），用 §3 B 的明文方式。
